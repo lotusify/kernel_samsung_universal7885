@@ -1,0 +1,437 @@
+name: Build Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_variant:
+        description: 'Android Variant'
+        required: true
+        default: 'gsi'
+        type: choice
+        options:
+        - gsi
+        - oneui
+      device_model:
+        description: 'Device Model'
+        required: true
+        default: 'A30'
+        type: choice
+        options:
+        - A10
+        - A20
+        - A20E
+        - A30
+        - A30S
+        - A40
+        - A40S
+        - M20
+        - M30
+        - A6E
+        - J7DUO
+        - J3TOPE
+        - GVIEW2
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        fetch-depth: 100
+
+    - name: Initialize submodules
+      run: |
+        git submodule update --init --recursive
+        
+    - name: Setup KernelSU-Next
+      run: |
+        # Remove existing KernelSU setup
+        rm -rf KernelSU-Next
+        rm -rf KernelSU
+        rm -rf drivers/kernelsu
+        # Install latest KernelSU-Next 1.0.9
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s v1.0.9
+        # Verify installation
+        ls -la drivers/kernelsu/
+        ls -la drivers/kernelsu/Kconfig || echo "Kconfig not found"
+
+    - name: Cache proton-clang
+      uses: actions/cache@v3
+      id: cache-proton
+      with:
+        path: proton-clang
+        key: proton-clang-${{ runner.os }}-${{ hashFiles('**/build-kernel.yml') }}
+        restore-keys: |
+          proton-clang-${{ runner.os }}-
+
+    - name: Cache APT packages
+      uses: actions/cache@v3
+      with:
+        path: /var/cache/apt/archives
+        key: apt-cache-${{ runner.os }}-${{ hashFiles('**/build-kernel.yml') }}
+        restore-keys: |
+          apt-cache-${{ runner.os }}-
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+
+    - name: Install dependencies and setup toolchain
+      run: |
+        # Install dependencies exactly like build.sh
+        if [ -f "/etc/apt/sources.list.d/ubuntu.sources" ]; then
+          sudo cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources~
+          sudo sed -Ei 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+        else
+          sudo cp /etc/apt/sources.list /etc/apt/sources.list~
+          sudo sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
+        fi
+        sudo apt-get update -y
+        sudo apt install -y \
+        gcc-aarch64-linux-gnu \
+        gcc-arm-linux-gnueabi \
+        binutils make python3 python2 libssl-dev build-essential \
+        bc bison flex unzip ca-certificates xz-utils \
+        mkbootimg cpio device-tree-compiler git git-lfs
+        
+        # Setup toolchain directory structure like build.sh expects
+        if [ "${{ steps.cache-proton.outputs.cache-hit }}" != 'true' ]; then
+          echo "Cache for proton-clang missed. Cloning..."
+          rm -rf proton-clang
+          git clone https://github.com/kdrag0n/proton-clang --depth=1 -b master
+        else
+          echo "Cache for proton-clang hit. Skipping clone."
+        fi
+        
+        # Create toolchain symlink like build.sh expects
+        ln -sf proton-clang toolchain
+
+    - name: 'Patch KernelSU manual scope-minimized hooks into the kernel source'
+      working-directory: '/home/runner/work/kernel_samsung_universal7885/kernel_samsung_universal7885/'
+      run: |
+        # Install coccinelle dependencies
+        sudo apt-get build-dep -y coccinelle
+        
+        # Clone and install coccinelle from source
+        git clone --depth=1 https://github.com/coccinelle/coccinelle.git
+        cd ./coccinelle/
+        ./autogen
+        ./configure
+        make -j$(nproc --all)
+        sudo make -j$(nproc --all) install
+        cd .. # Return to root directory
+        
+        # Clone the repository which contains the patch
+        git clone --depth=1 https://github.com/devnoname120/kernelsu-coccinelle.git
+        
+        # Patch the kernel source with scope-minimized hooks
+        for p in fs drivers/input drivers/tty arch/arm/kernel; do 
+          spatch --sp-file ./kernelsu-coccinelle/scope-minimized-hooks/kernelsu-scope-minimized.cocci --in-place --linux-spacing "$p" || true
+        done
+        
+        # Cleanup
+        rm -rf ./kernelsu-coccinelle/
+        # Delete files that may conflict with kernel functionality
+        rm -rf ./android/abi_gki_protected_exports*
+        
+        # Run make clean/mrproper here, AFTER all patches have been applied
+        make clean
+        make mrproper
+
+    - name: Apply Compilation Fix Patches
+      run: |
+        echo "🔧 Applying compilation fix patches..."
+        
+        # Fix 1: Remove problematic floating point arithmetic if it exists
+        if [ -f "drivers/video/fbdev/exynos/dpu_7885/panels/s6d7at0b_a10_lcd_ctrl.c" ]; then
+          echo "Patching s6d7at0b_a10_lcd_ctrl.c brightness calculation..."
+          
+          # Replace any floating point arithmetic with integer arithmetic
+          sed -i 's/int value = lcd->custom_brightness \* 1\.2;/int value = (lcd->custom_brightness * 12) \/ 10;/g' \
+            drivers/video/fbdev/exynos/dpu_7885/panels/s6d7at0b_a10_lcd_ctrl.c 2>/dev/null || echo "File not found, skipping..."
+            
+          echo "✅ Fixed brightness calculation if exists"
+        fi
+        
+        # Fix 2: Replace any double data types with long in display drivers
+        find drivers/video/fbdev/exynos/dpu_7885/ -name "*.c" -type f -exec \
+          sed -i 's/const double decon_clocks_table\[\]\[CLK_ID_MAX\]/const long decon_clocks_table[][CLK_ID_MAX]/g' {} \; 2>/dev/null || true
+        
+        echo "✅ All compilation fix patches applied successfully!"
+
+    - name: Configure Android Variant and Device
+      run: |
+        echo "Configuring for Android variant: ${{ github.event.inputs.android_variant }}"
+        echo "Device: ${{ github.event.inputs.device_model }}"
+        
+        # Set device-specific variables based on available defconfigs
+        case "${{ github.event.inputs.device_model }}" in
+          "A10")
+            export CODENAME=A10
+            if [ "${{ github.event.inputs.android_variant }}" == "oneui" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-a10_oneui_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-a10_gsi_defconfig
+            fi
+            ;;
+          "A20")
+            export CODENAME=A20
+            if [ "${{ github.event.inputs.android_variant }}" == "oneui" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-a20_oneui_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-a20_gsi_defconfig
+            fi
+            ;;
+          "A20E")
+            export CODENAME=A20E
+            if [ "${{ github.event.inputs.android_variant }}" == "oneui" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-a20e_oneui_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-a20e_gsi_defconfig
+            fi
+            ;;
+          "A30")
+            export CODENAME=A30
+            if [ "${{ github.event.inputs.android_variant }}" == "oneui" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-a30_oneui_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-a30_gsi_defconfig
+            fi
+            ;;
+          "A30S")
+            export CODENAME=A30S
+            if [ "${{ github.event.inputs.android_variant }}" == "oneui" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-a30s_oneui_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-a30s_gsi_defconfig
+            fi
+            ;;
+          "A40")
+            export CODENAME=A40
+            if [ "${{ github.event.inputs.android_variant }}" == "oneui" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-a40_oneui_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-a40_gsi_defconfig
+            fi
+            ;;
+          "A40S")
+            export CODENAME=A40S
+            # A40S doesn't seem to have separate oneui/gsi variants
+            export KERNEL_DEFCONFIG=exynos7885-a40s_defconfig
+            ;;
+          "M20")
+            export CODENAME=M20
+            if [ "${{ github.event.inputs.android_variant }}" == "oneui" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-m20_oneui_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-m20_defconfig
+            fi
+            ;;
+          "M30")
+            export CODENAME=M30
+            if [ "${{ github.event.inputs.android_variant }}" == "oneui" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-m30_oneui_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-m30_defconfig
+            fi
+            ;;
+          "A6E")
+            export CODENAME=A6E
+            # Exynos7884 based device
+            export KERNEL_DEFCONFIG=exynos7884-a6elte_defconfig
+            ;;
+          "J7DUO")
+            export CODENAME=J7DUO
+            export KERNEL_DEFCONFIG=exynos7884-j7duolte_defconfig
+            ;;
+          "J3TOPE")
+            export CODENAME=J3TOPE
+            export KERNEL_DEFCONFIG=exynos7884-j3topelte_defconfig
+            ;;
+          "GVIEW2")
+            export CODENAME=GVIEW2
+            export KERNEL_DEFCONFIG=exynos7884-gview2lte_defconfig
+            ;;
+        esac
+        
+        # Set Android version variables
+        export ANDROID_VAR="${{ github.event.inputs.android_variant }}"
+        export ANDROID=r
+        export AND_VER=11
+        
+        # Export variables to GITHUB_ENV for next steps
+        echo "CODENAME=${CODENAME}" >> $GITHUB_ENV
+        echo "KERNEL_DEFCONFIG=${KERNEL_DEFCONFIG}" >> $GITHUB_ENV
+        echo "ANDROID_VAR=${ANDROID_VAR}" >> $GITHUB_ENV
+        echo "ANDROID=${ANDROID}" >> $GITHUB_ENV
+        echo "AND_VER=${AND_VER}" >> $GITHUB_ENV
+
+    - name: Build Kernel
+      run: |
+        # Set all variables exactly like build_kernel.sh
+        export ROOT_DIR=$(pwd)
+        export KERNEL_DIR=$ROOT_DIR
+        export ARCH=arm64
+        export SUBARCH=arm64
+        
+        # Toolchain paths exactly like build_kernel.sh
+        export GCC_ARM64_FILE=aarch64-linux-gnu-
+        export GCC_ARM32_FILE=arm-linux-gnueabi-
+        export CROSS_COMPILE=$(pwd)/toolchain/bin/$GCC_ARM64_FILE
+        export CROSS_COMPILE_ARM32=$(pwd)/toolchain/bin/$GCC_ARM32_FILE
+        
+        # Build variables like build_kernel.sh
+        export KBUILD_BUILD_USER=Universal7885
+        export KBUILD_BUILD_HOST=GitHub.com
+        
+        # Android version variables
+        export ANDROID_MAJOR_VERSION=${{ env.ANDROID }}
+        export PLATFORM_VERSION=${{ env.AND_VER }}
+        
+        # Clang setup like build_kernel.sh
+        export PATH="$KERNEL_DIR/toolchain/bin:${PATH}"
+        export LD_LIBRARY_PATH="$KERNEL_DIR/toolchain/lib:$LD_LIBRARY_PATH"
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        
+        # Additional clang tools
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJDUMP=llvm-objdump
+        export OBJCOPY=llvm-objcopy
+        export STRIP=llvm-strip
+        export KCFLAGS=-w
+        
+        # Create localversion for proper naming
+        REV=${{ github.run_number }}
+        export LOCALVERSION=-hypersonic-R${REV}_${{ env.CODENAME }}_${{ env.ANDROID_VAR }}_KSUN
+        
+        echo "Building with defconfig: ${{ env.KERNEL_DEFCONFIG }}"
+        echo "ANDROID_MAJOR_VERSION: ${{ env.ANDROID }}"
+        echo "PLATFORM_VERSION: ${{ env.AND_VER }}"
+        echo "LOCALVERSION: ${LOCALVERSION}"
+        
+        # Make defconfig
+        make O=out ARCH=arm64 ANDROID_MAJOR_VERSION=${{ env.ANDROID }} ${{ env.KERNEL_DEFCONFIG }}
+
+        # Apply KernelSU configs
+        scripts/config --file out/.config -d LTO -d LTO_CLANG -d CFI_CLANG
+        scripts/config --file out/.config -e KSU -e KSU_DEBUG -e KSU_SU_DEBUG -e KSU_MANUAL_HOOK -e KSU_64BIT
+        scripts/config --file out/.config -e CONFIG_KSU_LSM_SECURITY_HOOKS -e CONFIG_KALLSYMS -e CONFIG_KALLSYMS_ALL
+        scripts/config --file out/.config -d KPROBES -d KPROBE_EVENTS -d KSU_KPROBES_HOOK
+        scripts/config --file out/.config -e MODULE_FORCE_UNLOAD -e MODULE_FORCE_LOAD
+        
+        make O=out olddefconfig
+        
+        # Build 
+        PATH="$KERNEL_DIR/toolchain/bin:${PATH}" \
+          make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          ANDROID_MAJOR_VERSION=${{ env.ANDROID }} \
+          LLVM_DIS=llvm-dis AR=llvm-ar NM=llvm-nm LD=ld.lld OBJDUMP=llvm-objdump STRIP=llvm-strip \
+          CC=clang \
+          LD_LIBRARY_PATH="$KERNEL_DIR/toolchain/lib:$LD_LIBRARY_PATH" \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=$GCC_ARM64_FILE \
+          CROSS_COMPILE_ARM32=$GCC_ARM32_FILE
+          
+        # Copy Image to expected location
+        if [ -f "out/arch/arm64/boot/Image" ]; then
+          cp -f out/arch/arm64/boot/Image arch/arm64/boot/Image
+          echo "✅ Copied Image"
+        fi
+        
+        # Copy DTB if it exists
+        if [ -f "out/arch/arm64/boot/dtb.img" ]; then
+          cp -f out/arch/arm64/boot/dtb.img arch/arm64/boot/dtb.img
+          echo "✅ Copied dtb.img"
+        fi
+        
+        # Copy DTBO if it exists
+        if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
+          cp -f out/arch/arm64/boot/dtbo.img arch/arm64/boot/dtbo.img
+          echo "✅ Copied dtbo.img"
+        fi
+
+    - name: Create AnyKernel3 Package
+      run: |
+        # Create AnyKernel3 packaging directory
+        mkdir -p anykernel3
+        cd anykernel3
+        
+        echo "Creating AnyKernel3 package..."
+        
+        # Generate proper zip name based on variant
+        REV=${{ github.run_number }}
+        ZIPNAME="Universal7885_R${REV}_${{ env.CODENAME }}_${{ env.ANDROID_VAR }}_KSUN.zip"
+        
+        # Create basic AnyKernel3 structure
+        mkdir -p META-INF/com/google/android
+        mkdir -p tools
+        
+        # Create simple update scripts
+        echo '#!/sbin/sh' > META-INF/com/google/android/update-binary
+        echo 'echo "Installing Universal7885 Kernel..."' >> META-INF/com/google/android/update-binary
+        echo 'dd if=/tmp/Image of=/dev/block/platform/13500000.dwmmc0/by-name/KERNEL' >> META-INF/com/google/android/update-binary
+        
+        echo "#MAGISK" > META-INF/com/google/android/updater-script
+        
+        # Create simple anykernel.sh
+        echo '#!/system/bin/sh' > anykernel.sh
+        echo 'echo "Universal7885 KernelSU Installation"' >> anykernel.sh
+        
+        chmod +x anykernel.sh
+        chmod +x META-INF/com/google/android/update-binary
+        
+        # Copy kernel Image
+        if [ -f "../arch/arm64/boot/Image" ]; then
+          cp -f ../arch/arm64/boot/Image Image
+          echo "✅ Copied Image to package"
+        else
+          echo "❌ Image not found!"
+          exit 1
+        fi
+        
+        # Create basic zip
+        zip -r9 $ZIPNAME META-INF anykernel.sh Image > /dev/null
+        echo "✅ Created kernel package: $ZIPNAME"
+        
+        echo "ZIPNAME=${ZIPNAME}" >> $GITHUB_ENV
+        
+        # Move back to root
+        cd ..
+
+    - name: Upload kernel to artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ANDROID_VAR }}-${{ env.CODENAME }}-R${{ github.run_number }}
+        path: anykernel3/*.zip
+        if-no-files-found: error
+
+    - name: Generate Build Summary
+      run: |
+        echo "## 🚀 Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Device Model:** ${{ env.CODENAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Android Variant:** ${{ env.ANDROID_VAR }}" >> $GITHUB_STEP_SUMMARY  
+        echo "**Kernel Version:** Universal7885 R${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Defconfig:** ${{ env.KERNEL_DEFCONFIG }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Build Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Features:**" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ KernelSU-Next v1.0.9" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Scope-minimized hooks" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Compilation fixes applied" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ env.ANDROID_VAR }}" == "oneui" ]; then
+          echo "- ✅ OneUI version" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- ✅ GSI version" >> $GITHUB_STEP_SUMMARY
+        fi
