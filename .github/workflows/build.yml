@@ -346,7 +346,7 @@ jobs:
           make -j$(nproc --all) O=out \
           ARCH=arm64 \
           ANDROID_MAJOR_VERSION=${{ env.ANDROID }} \
-          LLVM_DIS=llvm-dis AR=llvm-ar NM=llvm-nm LD=ld.lld OBJDUMP=llvm-objdump STRIP=llvm-strip \
+          AR=llvm-ar NM=llvm-nm OBJDUMP=llvm-objdump STRIP=llvm-strip \
           CC=clang \
           LD_LIBRARY_PATH="$KERNEL_DIR/toolchain/lib:$LD_LIBRARY_PATH" \
           CLANG_TRIPLE=aarch64-linux-gnu- \
