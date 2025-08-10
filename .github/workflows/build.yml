@@ -302,13 +302,14 @@ jobs:
         export CC=clang
         export CLANG_TRIPLE=aarch64-linux-gnu-
         
-        # Additional clang tools
+        # Additional clang tools and flags
         export AR=llvm-ar
         export NM=llvm-nm
         export OBJDUMP=llvm-objdump
         export OBJCOPY=llvm-objcopy
         export STRIP=llvm-strip
-        export KCFLAGS=-w
+        export KCFLAGS="-w -Wno-unused-command-line-argument"
+        export KASLR_FLAG=""
         
         # Create localversion for proper naming
         REV=${{ github.run_number }}
@@ -328,6 +329,15 @@ jobs:
         scripts/config --file out/.config -e CONFIG_KSU_LSM_SECURITY_HOOKS -e CONFIG_KALLSYMS -e CONFIG_KALLSYMS_ALL
         scripts/config --file out/.config -d KPROBES -d KPROBE_EVENTS -d KSU_KPROBES_HOOK
         scripts/config --file out/.config -e MODULE_FORCE_UNLOAD -e MODULE_FORCE_LOAD
+        
+        # Fix crypto compilation issues with Clang
+        scripts/config --file out/.config -d CRYPTO_AES_ARM64_CE
+        scripts/config --file out/.config -d CRYPTO_AES_ARM64_CE_CCM
+        scripts/config --file out/.config -d CRYPTO_AES_ARM64_CE_BLK
+        scripts/config --file out/.config -d CRYPTO_SHA1_ARM64_CE
+        scripts/config --file out/.config -d CRYPTO_SHA2_ARM64_CE
+        scripts/config --file out/.config -d CRYPTO_GHASH_ARM64_CE
+        scripts/config --file out/.config -d CRYPTO_CRC32_ARM64_CE
         
         make O=out olddefconfig
         
